@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  This SAM template will create the resources necessary to run MediaInfo in a Lambda function
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 300
+    Tracing: Active
+
+  Api:
+    TracingEnabled: True
+
+Parameters:
+  Stage:
+    Type: String
+    Description: Deployment Environment
+    Default: dev
+    AllowedValues:
+      - dev
+      - uat
+  S3ContentBucketName:
+    Type: String
+    Description: Name of bucket to be used
+    AllowedPattern: (?!(^xn--|.+-s3alias$))^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$
+  S3ContentBucketPrefix:
+    Type: String
+    Description: Prefix (if any) of objects
+    AllowedPattern: ^[a-zA-Z0-9!_.*'()-/]{1,1024}$
+  S3OutputBucketName:
+    Type: String
+    Description: Name of bucket to save MediaInfo result
+    AllowedPattern: (?!(^xn--|.+-s3alias$))^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$
+  S3OutputBucketPrefix:
+    Type: String
+    Description: Prefix (if any) of MediaInfo result objects
+    AllowedPattern: ^[a-zA-Z0-9!_.*'()-/]{1,1024}$
+
+Resources:
+  BatchMediaInfoProducerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowS3Read
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${S3ContentBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${S3ContentBucketName}/${S3ContentBucketPrefix}
+        - PolicyName: AllowSQSWrite
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Condition:
+                  Bool:
+                    aws:SecureTransport: True
+                Resource:
+                  - !GetAtt MediaInfoObjectQueue.Arn
+        - PolicyName: AllowDeadLetterSQSWrite
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Condition:
+                  Bool:
+                    aws:SecureTransport: True
+                Resource:
+                  - !GetAtt BatchMediaInfoProducerDeadLetterQueue.Arn
+
+  BatchMediaInfoConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowS3Read
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                  - s3:GetObjectTagging
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${S3ContentBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${S3ContentBucketName}/${S3ContentBucketPrefix}/*
+        - PolicyName: AllowS3Write
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectTagging
+                  - s3:PutObjectVersionTagging
+                  - s3:PutObjectRetention
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${S3OutputBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${S3OutputBucketName}/${S3OutputBucketPrefix}/*
+        - PolicyName: AllowSQSRead
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Resource:
+                  - !GetAtt MediaInfoObjectQueue.Arn
+        - PolicyName: AllowDeadLetterSQSWrite
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Condition:
+                  Bool:
+                    aws:SecureTransport: True
+                Resource:
+                  - !GetAtt BatchMediaInfoConsumerDeadLetterQueue.Arn
+
+  BatchMediaInfoProducer:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: mediainfo-producer.lambda_handler
+      Role: !GetAtt BatchMediaInfoProducerRole.Arn
+      Layers:
+        - !Ref PythonMediaInfoLayer
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      ReservedConcurrentExecutions: 1
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt BatchMediaInfoProducerDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3ContentBucketName
+          BUCKET_PREFIX: !Ref S3ContentBucketPrefix
+          INGEST_QUEUE: !Ref MediaInfoObjectQueue
+
+  MediaInfoObjectQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: MediaInfoQueue
+      SqsManagedSseEnabled: True
+      VisibilityTimeout: 600
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MediaInfoObjectDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  MediaInfoObjectDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: MediaInfoDeadLetterQueue
+      SqsManagedSseEnabled: True
+      MessageRetentionPeriod: 86400
+
+  BatchMediaInfoProducerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: BatchMediaInfoProducerDeadLetterQueue
+      SqsManagedSseEnabled: True
+      MessageRetentionPeriod: 86400
+
+  BatchMediaInfoConsumerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: BatchMediaInfoConsumerDeadLetterQueue
+      SqsManagedSseEnabled: True
+      MessageRetentionPeriod: 86400
+
+  BatchMediaInfoConsumer:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: mediainfo-consumer.lambda_handler
+      Role: !GetAtt BatchMediaInfoConsumerRole.Arn
+      Layers:
+        - !Ref PythonMediaInfoLayer
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      ReservedConcurrentExecutions: 50
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt BatchMediaInfoConsumerDeadLetterQueue.Arn
+      Events:
+        SQSMediaInfoEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MediaInfoObjectQueue.Arn
+            BatchSize: 10
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3OutputBucketName
+          BUCKET_PREFIX: !Ref S3OutputBucketPrefix
+
+  PythonMediaInfoLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub python-mediainfo-bin-${Stage}
+      Description: Dependencies for BatchMediaInfo lambda function
+      ContentUri: pymediainfo-layer.zip  # this was generated from our Docker file
+      CompatibleRuntimes:
+        - python3.8
+        - python3.9
+      LicenseInfo: 'pymediainfo (MIT), mediainfo (BSD 2-Clause License)'
+      RetentionPolicy: Retain
